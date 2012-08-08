@@ -1,483 +1,558 @@
-/* Background script.
+'use strict';
 
-   Copyright (C) 2010-2012.
-
-   This file is part of Redirector.
-
-   Redirector is free software: you can redistribute it and/or modify
-   it under the terms of the GNU General Public License as published by
-   the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
-
-   Redirector is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU General Public License for more details.
-
-   You should have received a copy of the GNU General Public License
-   along with Redirector.  If not, see <http://www.gnu.org/licenses/>.
-
-   From Cyril Feng. */
-
-/*jslint browser: true, onevar: false, plusplus: false*/
-/*global $: true, $$: true, $v: true, $f: true, $i18n: true*/
-/*global chrome: true, localStorage: true, RuleList: true, Pref: true*/
-
-var onBeforeRequestListener = function (details) {
-    if ($v.redirected.hasOwnProperty(details.requestId)) {
-        $v.iconStatus[details.tabId] = true;
-        return;
-    }
-
-    for (var i = 0; i < $v.ruleAuto.length; i++) {
-        if ($v.ruleAuto[i].match.test(details.url)) { // Match
-            if ($v.ruleAuto[i].sub === null) {        // To block
-                return {cancel: true};
-            } else {            // To redirect
-                $v.redirected[details.requestId] = true;
-
-                return {redirectUrl:
-                        $f.getRedirUrl(details.url, $v.ruleAuto[i])};
-            }
-        }
-    }
+window.redirector_background_js = {
+  rule_lists: {
+    redirect: [],
+    manual: [],
+    request_header: [],
+    response_header: []
+  },
+  urls_filter: ['<all_urls>'],
+  redirected_requests: {}       // For recording redirected request ID
 };
 
-var onBeforeSendHeadersListener = function (details) {
-    for (var i = 0; i < $v.ruleReqHdr.length; i++) {
-        var currentRule = $v.ruleReqHdr[i];
+/* Initialize
+ */
+(function () {
+  var namespace = window.redirector_background_js;
+  chrome.storage.local.get(null, function (items) {
+    /* Settings data */
+    namespace.urls_filter = fallback(items.urls_filter, ['<all_urls>']);
+    /* Rules */
+    initFastMatchingRules(items.fast_matching);
+    initRedirectRules(items.redirect);
+    initRequestHeaderRules(items.request_header);
+    initResponseHeaderRules(items.response_header);
+    initOnlineRules(items.online);
+  });
+})();
 
-        if (currentRule.match.test(details.url)) { // match this URL
-            $v.iconStatus[details.tabId] = true;
+/**
+ * Fresh install
+ */
+chrome.runtime.onInstalled.addListener(function() {
+  // Open option pages, ...
+});
 
-            var currentHeaders = [];
-            for (var j = 0; j < details.requestHeaders.length; j++) {
-                currentHeaders.push(details.requestHeaders[j].name);
-            }
-
-            for (var j = 0; j < currentRule.sub.length; j++) {
-                var idx;
-                if ((idx = currentHeaders.indexOf(
-                    currentRule.sub[j])) !== -1) { // Exists
-                    details.requestHeaders[idx].value =
-                        currentRule.repl[j];
-                } else if ((idx = currentHeaders.indexOf(
-                    currentRule.sub[j].replace(/^-/, '')
-                )) !== -1) { // To del
-                    details.requestHeaders.splice(idx, 1);
-                } else {    // To create
-                    if ((/^(?!-)/).test(currentRule.sub[j])) {
-                        // Do not create headers with name `-...'
-                        details.requestHeaders.push({
-                            name: currentRule.sub[j],
-                            value: currentRule.repl[j]
-                        });
-                    }
-                }
-            }
-
-            return {requestHeaders: details.requestHeaders};
-        }
+/**
+ * Reload rules when storage changed
+ */
+chrome.storage.onChanged.addListener(function (changes, namespace) {
+  if (namespace !== 'local') {
+    return;
+  }
+  for (var key in changes) {
+    if (changes.hasOwnProperty(key) === false) {
+      return;
     }
-};
-
-var onHeadersReceivedListener = function (details) {
-    for (var i = 0; i < $v.ruleRespHdr.length; i++) {
-        var currentRule = $v.ruleRespHdr[i];
-
-        if (currentRule.match.test(details.url)) { // match this URL
-            $v.iconStatus[details.tabId] = true;
-
-            var currentHeaders = [];
-            for (var j = 0; j < details.responseHeaders.length; j++) {
-                currentHeaders.push(details.responseHeaders[j].name);
-            }
-
-            for (var j = 0; j < currentRule.sub.length; j++) {
-                var idx;
-                if ((idx = currentHeaders.indexOf(
-                    currentRule.sub[j])) !== -1) { // Exists
-                    details.responseHeaders[idx].value =
-                        currentRule.repl[j];
-                } else if ((idx = currentHeaders.indexOf(
-                    currentRule.sub[j].replace(/^-/, '')
-                )) !== -1) { // To del
-                    details.responseHeaders.splice(idx, 1);
-                } else {    // To create
-                    if ((/^(?!-)/).test(currentRule.sub[j])) {
-                        // Do not create headers with name `-...'
-                        details.responseHeaders.push({
-                            name: currentRule.sub[j],
-                            value: currentRule.repl[j]
-                        });
-                    }
-                }
-            }
-
-            return {responseHeaders: details.responseHeaders};
-        }
-    }
-};
-
-var loadPref = function () {           // Load preferences data
-    $v.prefData = (new Pref()).data; // All preferences data
-
-    if ($v.prefData.proto.all) {      // All protocols enabled
-        $v.validUrl = ['<all_urls>']; // Matches all protocols
-    } else {
-        $v.validUrl = [];
-        if ($v.prefData.proto.http) { // http:// enabled
-            $v.validUrl.push('http://*/*');
-        }
-        if ($v.prefData.proto.https) { // https:// enabled
-            $v.validUrl.push('https://*/*');
-        }
-        if ($v.prefData.proto.ftp) { // ftp:// enabled
-            $v.validUrl.push('ftp://*/*');
-        }
-        if ($v.prefData.proto.file) { // file:// enabled
-            $v.validUrl.push('file://*');
-        }
-    }
-};
-
-var updateContext = function () {      // Update the context menu
-    var onClick = function (info, tab) {
-        var rule = $v.ruleManual[
-            info.menuItemId - info.parentMenuItemId - 1
-        ];
-
-        if (info.hasOwnProperty('srcUrl')) {
-            chrome.tabs.create({
-                url: $f.getRedirUrl(info.srcUrl, rule)
-            }, function (tab2) {
-                $v.iconStatus[tab2.id] = true;
-            });
-        } else if (info.hasOwnProperty('linkUrl')) {
-            chrome.tabs.create({
-                url: $f.getRedirUrl(info.linkUrl, rule)
-            }, function (tab2) {
-                $v.iconStatus[tab2.id] = true;
-            });
-        } else {
-            $v.iconStatus[tab.id] = true;
-
-            chrome.tabs.update(tab.id, {
-                url: $f.getRedirUrl(info.pageUrl, rule)
-            });
-        }
-    };
-
-    chrome.contextMenus.removeAll(); // Remove previous menus
-
-    if ($v.status === true && $v.ruleManual.length > 0) {
-        if ($v.prefData.context.link) { // Links' context menu enabled
-            var parentLink = chrome.contextMenus.create({ // Parent
-                title: $i18n('CONTEXT_NEW_TAB'),
-                contexts: ['link', 'image']
-            });
-
-            for (var i = 0; i < $v.ruleManual.length; i++) { // Sub
-                chrome.contextMenus.create({
-                    title: $v.ruleManual[i].name,
-                    contexts: ['link', 'image'],
-                    parentId: parentLink,
-                    onclick: onClick
-                });
-            }
-        }
-
-        if ($v.prefData.context.page) { // Pages' context menu enabled
-            var parentPage = chrome.contextMenus.create({ // Parent
-                title: $i18n('CONTEXT_RELOAD_TAB'),
-                contexts: ['page', 'frame']
-            });
-
-            for (var i = 0; i < $v.ruleManual.length; i++) { // Sub
-                chrome.contextMenus.create({
-                    title: $v.ruleManual[i].name,
-                    contexts: ['page', 'frame'],
-                    parentId: parentPage,
-                    onclick: onClick
-                });
-            }
-        }
-    }
-
-    var title = $v.status === true ?
-        $i18n('CONTEXT_STATUS_ENABLED') :
-        $i18n('CONTEXT_STATUS_DISABLED');
-    chrome.contextMenus.create({ // Open options page
-        type: 'checkbox',
-        title: title,
-        checked: $v.status,
-        contexts: ['all'],
-        onclick: function (info) {
-            $v.status = info.checked;
-            localStorage.STATUS = JSON.stringify($v.status);
-            updateContext();
-            init();
-        }
-    });
-
-    chrome.contextMenus.create({ // Import a rule
-        title: $i18n('CONTEXT_IMPORT'),
-        contexts: ['link'],
-        onclick: function (info) {
-            var tmpList = new RuleList(true);
-            if (tmpList.restore(true, info.linkUrl) === true) {
-                $f.openOptions('?1');
-            }
-        }
-    });
-
-    chrome.contextMenus.create({ // Open options page
-        title: $i18n('CONTEXT_OPTIONS'),
-        contexts: ['all'],
-        onclick: function () {
-            $f.openOptions();
-        }
-    });
-};
-
-var loadRule = function (data) { // Called when rule list needs update
-    var dry = false;
-    if (typeof data !== 'undefined') {
-        dry = true;             // Dry run
-    } else {
-        data = (new RuleList(false)).data; // All rules list data
-    }
-
-    if (dry !== true) {
-        $v.ruleAuto = [];       // Rules for auto redir
-        $v.ruleManual = [];     // Rules for manual redir
-        $v.ruleReqHdr = [];     // Rules for http request header
-        $v.ruleRespHdr = [];     // Rules for http request header
-    }
-    for (var i = 0; i < data.length; i++) {
-        var rule = data[i];     // Current rule
-
-        // Rule must be enabled
-        if (dry === false &&
-            (! rule.hasOwnProperty('enabled') || ! rule.enabled)) {
-            continue;
-        }
-
-        // For a manual rule
-        if (rule.match.type === $v.type.manual) {
-            try {
-                var tmp = {     // Tmp manual rule, to be chked
-                    name: rule.name,
-                    sub: $f.str2re(rule.sub),
-                    repl: rule.repl.str,
-                    decode: rule.repl.decode
-                };
-                // RegExp syntax error
-                if (! tmp.sub.hasOwnProperty('global')) {
-                    return tmp.sub.toString();
-                }
-            } catch (e) {
-                continue;
-            }
-
-            if (dry !== true) {
-                $v.ruleManual.push(tmp); // Add to manual rule
-            }
-            continue;
-        }
-
-        // For a request header rule
-        if (rule.sub.type === $v.type.reqHdr) {
-            try {
-                var tmp = {
-                    match: $f.str2re(rule.match),
-                    sub: $f.splitVl(rule.sub.str),
-                    repl: $f.splitVl(rule.repl.str)
-                };
-                // Check match to see if RegExp syntax error
-                if (! tmp.match.hasOwnProperty('global')) {
-                    return tmp.match.toString();
-                }
-                // Check if sub and repl are of the same size
-                if (tmp.sub.length !== tmp.repl.length) {
-                    return $i18n('TEST_SUB_REPL_CONFLICT');
-                }
-            } catch (e) {
-                continue;
-            }
-
-            if (dry !== true) {
-                $v.ruleReqHdr.push(tmp);
-            }
-            continue;
-        }
-
-        // For a response header rule
-        if (rule.sub.type === $v.type.respHdr) {
-            try {
-                var tmp = {
-                    match: $f.str2re(rule.match),
-                    sub: $f.splitVl(rule.sub.str),
-                    repl: $f.splitVl(rule.repl.str)
-                };
-                // Check match to see if RegExp syntax error
-                if (! tmp.match.hasOwnProperty('global')) {
-                    return tmp.match.toString();
-                }
-                // Check if sub and repl are of the same size
-                if (tmp.sub.length !== tmp.repl.length) {
-                    return $i18n('TEST_SUB_REPL_CONFLICT');
-                }
-            } catch (e) {
-                continue;
-            }
-
-            if (dry !== true) {
-                $v.ruleRespHdr.push(tmp);
-            }
-            continue;
-        }
-
-        // For an auto rule
-        try {
-            var tmp = {             // Tmp auto rule, to be chked
-                match: $f.str2re(rule.match),
-                sub: $f.str2re(rule.sub),
-                repl: rule.repl.str,
-                decode: rule.repl.decode
-            };
-            // Check match/sub to see if RegExp syntax error
-            if (! tmp.match.hasOwnProperty('global')) {
-                return tmp.match.toString();
-            }
-            if (! tmp.sub.hasOwnProperty('global')) {
-                return tmp.sub.toString();
-            }
-        } catch (e) {
-            continue;
-        }
-
-        if (dry !== true) {
-            $v.ruleAuto.push(tmp); // Formally add to auto rule
-        }
-    }
-
-    updateContext();            // Now referesh context menu
-};
-
-var onRemoved = function (tabId) {
-    switch (tabId) {
-    case $v.optionTabId:
-        chrome.tabs.remove($v.debugeeTabId);
-        // $('dbg_stop').onclick();
-        break;
-    case $v.debugeeTabId:
-        var page = chrome.extension.getExtensionTabs()[0];
-        page.$('dbg_stop').hidden=true;
-        page.$('dbg_start').hidden=false;
-        break;
+    var value = changes[key].newValue;
+    switch (key) {
+    case 'fast_matching':
+      chrome.declarativeWebRequest.onRequest.removeRules(undefined, function () {
+        initFastMatchingRules(value);
+      });
+      break;
+    case 'redirect':
+      initRedirectRules(value);
+      break;
+    case 'request_header':
+      initRequestHeaderRules(value);
+      break;
+    case 'response_header':
+      initResponseHeaderRules(value);
+      break;
+    case 'online':
+      initOnlineRules(value);
+      break;
+    case 'enabled_protocols':
+      window.redirector_background_js.urls_filter = value;
+      break;
     default:
-        return;
+      console.log('Not implemented: ' + key);
+      return;
     }
+  }
+});
 
-    onInit();
+/* Register redirect rules */
+chrome.webRequest.onBeforeRequest.addListener(
+  processRedirectRules,
+  {urls: window.redirector_background_js.urls_filter},
+  ['blocking']
+);
 
-    chrome.tabs.onRemoved.removeListener(onRemoved);
-};
+/* Register request header rules */
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  processRequestHeaderRules,
+  {urls: window.redirector_background_js.urls_filter},
+  ['blocking', 'requestHeaders']
+);
 
-var onInit = function (debug) {
-    $v.redirected = {};
-    $v.iconStatus = {};
+/* Register response header rules */
+chrome.webRequest.onHeadersReceived.addListener(
+  processResponseHeaderRules,
+  {urls: window.redirector_background_js.urls_filter},
+  ['blocking', 'responseHeaders']
+);
 
-    // Show/hide notification icon
-    if (typeof debug === 'undefined') {
-        chrome.webNavigation.onCompleted.addListener(function (details) {
-            if ($v.prefData.disablePageAction === true ||
-                details.frameId > 0) {
-                return;
-            }
-
-            chrome.webNavigation.getFrame(
-                {tabId: details.tabId, frameId: 0},
-                function (info) {
-                    if (info === null) {
-                        return;
-                    }
-
-                    switch ($v.iconStatus[details.tabId]) {
-                    case true:
-                        try {
-                            chrome.pageAction.show(details.tabId);
-                        } catch (e) {}
-                        break;
-                    default:
-                        try {
-                            chrome.pageAction.hide(details.tabId);
-                        } catch (e) {}
-                        break;
-                    };
-
-                    $v.iconStatus[details.tabId] = false;
-                }
-            );
-        });
+/**
+ * Initialize fast matching rules
+ */
+function initFastMatchingRules(rules) {
+  if (rules === undefined || rules.length === 0) {
+    return;
+  }
+  var declarative_rules = [];
+  var priority = 101;         // Priority starts from 101
+  rules.forEach(function (rule) {
+    if (rule.enabled !== true) {
+      return;
     }
-
-    if (chrome.webRequest.onBeforeRequest.hasListener(
-        onBeforeRequestListener)) {
-        chrome.webRequest.onBeforeRequest.removeListener(
-            onBeforeRequestListener
+    var declarative_rule = {conditions: [], actions: []};
+    rule.conditions.forEach(function (condition) {
+      var resource_type = condition.resource_type;
+      var obj;
+      if (resource_type !== undefined) {
+        delete condition.resource_type;
+        obj = {
+          url: condition,
+          resourceType: resource_type
+        };
+      } else {
+        obj = {url: condition};
+      }
+      declarative_rule.conditions.push(
+        new chrome.declarativeWebRequest.RequestMatcher(obj)
+      );
+    });
+    rule.actions.forEach(function (action) {
+      switch (action.type) {
+      case 'redirect_regexp': // Modifiers?
+        declarative_rule.actions.push(
+          new chrome.declarativeWebRequest.RedirectByRegEx({
+            from: simplifyRe2RegexpString(action.from),
+            to: action.to
+          })
         );
-    }
-
-    if (chrome.webRequest.onBeforeSendHeaders.hasListener(
-        onBeforeSendHeadersListener)) {
-        chrome.webRequest.onBeforeSendHeaders.removeListener(
-            onBeforeSendHeadersListener
+        break;
+      case 'redirect_wildcard':
+        declarative_rule.actions.push(
+          new declarativeWebRequest.RedirectByRegEx({
+            from: wildcardToRegexpString(action.from),
+            to: action.to
+          })
         );
-    }
-
-    if (chrome.webRequest.onHeadersReceived.hasListener(
-        onHeadersReceivedListener)) {
-        chrome.webRequest.onHeadersReceived.removeListener(
-            onHeadersReceivedListener
+        break;
+      case 'redirect_cancel':
+        declarative_rule.actions.push(
+          new chrome.declarativeWebRequest.CancelRequest()
         );
-    }
-
-    if ($v.status === true && typeof debug === 'undefined') {
-        chrome.webRequest.onBeforeRequest.addListener( // Auto redir
-            onBeforeRequestListener, {urls: $v.validUrl}, ['blocking']
+        break;
+      case 'redirect_to':
+        declarative_rule.actions.push(
+          new chrome.declarativeWebRequest.RedirectRequest({
+            redirectUrl: action.to
+          })
         );
-
-        chrome.webRequest.onBeforeSendHeaders.addListener(
-            onBeforeSendHeadersListener,
-            {urls: $v.validUrl},
-            ['blocking', 'requestHeaders']
+        break;
+      case 'redirect_to_transparent':
+        declarative_rule.actions.push(
+          new chrome.declarativeWebRequest.RedirectToTransparentImage()
         );
-
-        chrome.webRequest.onHeadersReceived.addListener(
-            onHeadersReceivedListener,
-            {urls: $v.validUrl},
-            ['blocking', 'responseHeaders']
+        break;
+      case 'redirect_to_empty':
+        declarative_rule.actions.push(
+          new chrome.declarativeWebRequest.RedirectToEmptyDocument()
         );
-    }
-};
-
-try {                           // Enabled or disabled
-    $v.status = JSON.parse(localStorage.STATUS);
-} catch (e) {
-    $v.status = true;
-    localStorage.STATUS = JSON.stringify(true);
+        break;
+      case 'request_header_set':
+        declarative_rule.actions.push(
+          new chrome.declarativeWebRequest.SetRequestHeader({
+            name: action.name,
+            value: action.value
+          })
+        );
+      case 'request_header_remove':
+        declarative_rule.actions.push(
+          new chrome.declarativeWebRequest.RemoveRequestHeader({
+            name: action.name
+          })
+        );
+        break;
+      case 'response_header_add':
+        declarative_rule.actions.push(
+          new chrome.declarativeWebRequest.AddResponseHeader({
+            name: action.name,
+            value: action.value
+          })
+        );
+      case 'response_header_remove':
+        if (action.value) {     // Can value be empty?
+          declarative_rule.actions.push(
+            new chrome.declarativeWebRequest.RemoveResponseHeader({
+              name: action.name,
+              value: action.value
+            })
+          );
+        } else {
+          declarative_rule.actions.push(
+            new chrome.declarativeWebRequest.RemoveResponseHeader({
+              name: action.name
+            })
+          );
+        }
+        break;
+      default:
+        assertError(false, new Error());
+      }
+    });
+    declarative_rule.priority = priority++; // MAX?
+    declarative_rules.push(declarative_rule);
+  });
+  if (declarative_rules.length > 0) {
+    chrome.declarativeWebRequest.onRequest.addRules(declarative_rules);
+  }
 }
 
-loadPref();                     // Load preferences data
-loadRule();                     // Load rule list
-onInit();                       // Initialize
+/**
+ * Initialize redirect rules
+ */
+function initRedirectRules(rules) {
+  if (rules === undefined || rules.length === 0) {
+    return;
+  }
+  var redirect = [];
+  var manual = [];
+  rules.forEach(function (rule) {
+    if (rule.enabled !== true) {
+      return;
+    }
+    var auto_rule = {conditions: [], actions: []};
+    var manual_rule = {actions: []};
+    var is_manual_rule = false;
+    rule.conditions.forEach(function (condition) {
+      var resource_type = condition.resource_type;
+      var obj;
+      if (resource_type !== undefined) {
+        delete condition.resource_type;
+        obj = {resourceType: resource_type};
+      } else {
+        obj = {};
+      }
+      switch (condition.type) {
+      case 'regexp':
+        obj.regexp = regexpStringToRegexp(condition.value, condition.modifiers);
+        auto_rule.conditions.push(obj);
+        break;
+      case 'wildcard':
+        obj.regexp = wildcardToRegexp(condition.value, condition.modifiers);
+        auto_rule.conditions.push(obj);
+        break;
+      case 'manual':
+        is_manual_rule = true;
+        break;
+      default:
+        assertError(false, new Error());
+      }
+    });
+    rule.actions.forEach(function (action) {
+      var rule_actions = (is_manual_rule ? manual_rule : auto_rule).actions;
+      switch (action.type) {
+      case 'redirect_regexp':
+        rule_actions.push({
+          from: regexpStringToRegexp(action.from, action.modifiers),
+          to: action.to
+        });
+        break;
+      case 'redirect_wildcard':
+        rule_actions.push({
+          from: wildcardToRegexp(action.from, action.modifiers),
+          to: action.to
+        });
+        break;
+      case 'redirect_cancel':
+        rule_actions.push({to: null});
+        break;
+      case 'redirect_to':
+        rule_actions.push({to: action.to});
+        break;
+      case 'redirect_to_transparent':
+        // TODO
+        break;
+      case 'redirect_to_empty':
+        // TODO
+        break;
+      default:
+        assertError(false, new Error());
+      }
+    });
+    if (is_manual_rule) {
+      manual.push(manual_rule);
+    } else {
+      redirect.push(auto_rule);
+    }
+  });
+  window.redirector_background_js.rule_lists.redirect = redirect;
+  window.redirector_background_js.rule_lists.manual = manual;
+}
 
-try {                           // First install
-    var version = JSON.parse(localStorage.VERSION);
-} catch (e) {
-    localStorage.VERSION =
-        JSON.stringify(chrome.app.getDetails().version);
-    $f.openOptions();
+/**
+ * Initialize request header rules
+ */
+function initRequestHeaderRules(rules) {
+  if (rules === undefined || rules.length === 0) {
+    return;
+  }
+  var request_header = [];
+  rules.forEach(function (rule) {
+    if (rule.enabled !== true) {
+      return;
+    }
+    var auto_rule = {conditions: [], actions: []};
+    rule.conditions.forEach(function (condition) {
+      var resource_type = condition.resource_type;
+      var obj;
+      if (resource_type !== undefined) {
+        delete condition.resource_type;
+        obj = {resourceType: resource_type};
+      } else {
+        obj = {};
+      }
+      switch (condition.type) {
+      case 'regexp':
+        obj.regexp = regexpStringToRegexp(condition.value, condition.modifiers);
+        auto_rule.conditions.push(obj);
+        break;
+      case 'wildcard':
+        obj.regexp = wildcardToRegexp(condition.value, condition.modifiers);
+        auto_rule.conditions.push(obj);
+        break;
+      default:
+        assertError(false, new Error());
+      }
+    });
+    rule.actions.forEach(function (action) {
+      switch (action.type) {
+      case 'request_header_set':
+        auto_rule.actions.push({
+          type: 'set',
+          name: action.name,
+          value: action.value
+        });
+        break;
+      case 'request_header_remove':
+        auto_rule.actions.push({
+          type: 'remove',
+          name: action.name
+        });
+        break;
+      default:
+        assertError(false, new Error());
+      }
+    });
+    request_header.push(auto_rule);
+  });
+  window.redirector_background_js.rule_lists.request_header = request_header;
+}
+
+/**
+ * Initialize response header rules
+ */
+function initResponseHeaderRules(rules) {
+  if (rules === undefined || rules.length === 0) {
+    return;
+  }
+  var response_header = [];
+  rules.forEach(function (rule) {
+    if (rule.enabled !== true) {
+      return;
+    }
+    var auto_rule = {conditions: [], actions: []};
+    rule.conditions.forEach(function (condition) {
+      switch (condition.type) {
+      case 'regexp':
+        auto_rule.conditions.push(
+          regexpStringToRegexp(condition.value, condition.modifiers));
+        break;
+      case 'wildcard':
+        auto_rule.conditions.push(
+          wildcardToRegexp(condition.value, condition.modifiers));
+        break;
+      default:
+        assertError(false, new Error());
+      }
+    });
+    rule.actions.forEach(function (action) {
+      switch (action.type) {
+      case 'response_header_add':
+        auto_rule.actions.push({
+          type: 'add',
+          name: action.name,
+          value: action.value
+        });
+        break;
+      case 'response_header_remove':
+        auto_rule.actions.push(
+          action.value === undefined ? {
+            type: 'remove',
+            name: action.name
+          } : {
+            type: 'remove',
+            name: action.name,
+            value: action.value
+          }
+        );
+        break;
+      default:
+        assertError(false, new Error());
+      }
+    });
+    response_header.push(auto_rule);
+  });
+  window.redirector_background_js.rule_lists.response_header =
+    response_header;
+}
+
+/**
+ * Initialize online rules
+ */
+function initOnlineRules(rules) {
+  // TODO
+}
+
+/**
+ * Redirect rules listener
+ * Redirect the request if any conditions meets.
+ * Multiple actions are allowed in case they're of type
+ * redirect_regexp or redirect_wildcard
+ */
+function processRedirectRules(details) {
+  if (window.redirector_background_js
+      .redirected_requests[details.requestId] !== undefined) {
+    return {};
+  }
+  var list = window.redirector_background_js.rule_lists.redirect;
+  var redirectUrl = '';
+  outmost:
+  for (var i = 0; i < list.length; i++) {
+    var rule = list[i];
+    for (var j = 0; j < rule.conditions.length; j++) {
+      var condition = rule.conditions[j];
+      /* Not in the resource type list OR not matches */
+      if (condition.resource_type !== undefined &&
+          condition.indexOf(details.type) === -1 ||
+          !condition.regexp.test(details.url)) {
+        continue;
+      }
+      for (var k = 0; k < rule.actions.length; k++) {
+        var action = rule.actions[k];
+        /* Cancel request */
+        if (action.to === null) {
+          return {cancel: true};
+        }
+        /* Directly redirect */
+        if (action.from === undefined) {
+          return {redirectUrl: rule.actions.to};
+        }
+        redirectUrl = details.url.replace(action.from, action.to);
+      }
+      break outmost;
+    }
+  }
+  if (redirectUrl) {
+    window.redirector_background_js
+      .redirected_requests[details.requestId] = true;
+    return {redirectUrl: redirectUrl};
+  }
+  return {};
+}
+
+/**
+ * Request header rules listener
+ */
+function processRequestHeaderRules(details) {
+  var list = window.redirector_background_js.rule_lists.request_header;
+  outmost:
+  for (var i = 0; i < list.length; i++) {
+    var rule = list[i];
+    for (var j = 0; j < rule.conditions.length; j++) {
+      var condition = rule.conditions[j];
+      /* Not in the resource type list OR not matches */
+      if (condition.resource_type !== undefined &&
+          condition.indexOf(details.type) === -1 ||
+          !condition.regexp.test(details.url)) {
+        continue;
+      }
+      var header_names = [];
+      details.requestHeaders.forEach(function (header) {
+        header_names.push(header.name);
+      });
+      for (var k = 0; k < rule.actions.length; k++) {
+        var action = rule.actions[k];
+        var index = header_names.indexOf(action.name);
+        switch (action.type) {
+        case 'set':
+          if (index === -1) {
+            details.requestHeaders.push({
+              name: action.name, value: action.value
+            });
+          } else {
+            details.requestHeaders[index].value = action.value;
+          }
+          break;
+        case 'remove':
+          if (index !== -1) {
+            details.requestHeaders.splice(index, 1);
+          }
+          break;
+        default:
+          assertError(false, new Error());
+        }
+      }
+      return {requestHeaders: details.requestHeaders};
+    }
+  }
+}
+
+/**
+ * Response header rules listener
+ */
+function processResponseHeaderRules(details) {
+  var list = window.redirector_background_js.rule_lists.response_header;
+  outmost:
+  for (var i = 0; i < list.length; i++) {
+    var rule = list[i];
+    for (var j = 0; j < rule.conditions.length; j++) {
+      var condition = rule.conditions[j];
+      /* Not in the resource type list OR not matches */
+      if (condition.resource_type !== undefined &&
+          condition.indexOf(details.type) === -1 ||
+          !condition.regexp.test(details.url)) {
+        continue;
+      }
+      var header_names = [];
+      details.responseHeaders.forEach(function (header) {
+        header_names.push(header.name);
+      });
+      for (var k = 0; k < rule.actions.length; k++) {
+        var action = rule.actions[k];
+        switch (action.type) {
+        case 'set':
+          details.responseHeaders.push({
+            name: action.name, value: action.value
+          });
+          break;
+        case 'remove':
+          var index = header_names.indexOf(action.name);
+          if (index !== -1) {
+            details.responseHeaders.splice(index, 1);
+          }
+          break;
+        default:
+          assertError(false, new Error());
+        }
+      }
+      return {responseHeaders: details.responseHeaders};
+    }
+  }
 }
